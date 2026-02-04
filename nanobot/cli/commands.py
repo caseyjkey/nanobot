@@ -124,7 +124,7 @@ def onboard():
                 config.providers.gemini.api_key, config.providers.groq.api_key]):
         console.print("  1. Add your API key to [cyan]~/.nanobot/config.json[/cyan]")
     console.print("  2. Chat: [cyan]nanobot agent -m \"Hello!\"[/cyan]")
-    console.print("\n[dim]Want Telegram/WhatsApp? See: https://github.com/HKUDS/nanobot#-chat-apps[/dim]")
+    console.print("\n[dim]Want Telegram/WhatsApp/Signal? See: https://github.com/HKUDS/nanobot#-chat-apps[/dim]")
 
 
 
