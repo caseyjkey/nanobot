@@ -2,5 +2,6 @@
 
 from nanobot.channels.base import BaseChannel
 from nanobot.channels.manager import ChannelManager
+from nanobot.channels.signal import SignalChannel
 
-__all__ = ["BaseChannel", "ChannelManager"]
+__all__ = ["BaseChannel", "ChannelManager", "SignalChannel"]
