@@ -30,11 +30,21 @@ class FeishuConfig(BaseModel):
     allow_from: list[str] = Field(default_factory=list)  # Allowed user open_ids
 
 
+class SignalConfig(BaseModel):
+    """Signal channel configuration."""
+    enabled: bool = False
+    phone_number: str = ""  # Bot phone number (e.g., +1234567890)
+    signal_service: str = ""  # signal-cli-rest-api address (e.g., 127.0.0.1:8080)
+    allow_from: list[str] = Field(default_factory=list)  # Allowed phone numbers
+
+
+
 class ChannelsConfig(BaseModel):
     """Configuration for chat channels."""
     whatsapp: WhatsAppConfig = Field(default_factory=WhatsAppConfig)
     telegram: TelegramConfig = Field(default_factory=TelegramConfig)
     feishu: FeishuConfig = Field(default_factory=FeishuConfig)
+    signal: SignalConfig = Field(default_factory=SignalConfig)
 
 
 class AgentDefaults(BaseModel):
@@ -53,8 +63,12 @@ class AgentsConfig(BaseModel):
 
 class ProviderConfig(BaseModel):
     """LLM provider configuration."""
-    api_key: str = ""
-    api_base: str | None = None
+    api_key: str = Field(default="", alias="apiKey")
+    api_base: str | None = Field(default=None, alias="apiBase")
+    coding_plan: bool = Field(default=False, alias="codingPlan")  # Z.AI coding plan uses different endpoint
+    
+    class Config:
+        populate_by_name = True
 
 
 class ProvidersConfig(BaseModel):
@@ -126,10 +140,12 @@ class Config(BaseSettings):
         )
     
     def get_api_base(self) -> str | None:
-        """Get API base URL if using OpenRouter, Zhipu or vLLM."""
+        """Get API base URL if using OpenRouter, Zhipu (with coding plan support) or vLLM."""
         if self.providers.openrouter.api_key:
             return self.providers.openrouter.api_base or "https://openrouter.ai/api/v1"
         if self.providers.zhipu.api_key:
+            if self.providers.zhipu.coding_plan:
+                return "https://api.z.ai/api/coding/paas/v4"
             return self.providers.zhipu.api_base
         if self.providers.vllm.api_base:
             return self.providers.vllm.api_base
