@@ -51,8 +51,12 @@ class AgentsConfig(BaseModel):
 
 class ProviderConfig(BaseModel):
     """LLM provider configuration."""
-    api_key: str = ""
-    api_base: str | None = None
+    api_key: str = Field(default="", alias="apiKey")
+    api_base: str | None = Field(default=None, alias="apiBase")
+    coding_plan: bool = Field(default=False, alias="codingPlan")  # Z.AI coding plan uses different endpoint
+    
+    class Config:
+        populate_by_name = True
 
 
 class ProvidersConfig(BaseModel):
@@ -122,10 +126,12 @@ class Config(BaseSettings):
         )
     
     def get_api_base(self) -> str | None:
-        """Get API base URL if using OpenRouter, Zhipu or vLLM."""
+        """Get API base URL if using OpenRouter, Zhipu (with coding plan support) or vLLM."""
         if self.providers.openrouter.api_key:
             return self.providers.openrouter.api_base or "https://openrouter.ai/api/v1"
         if self.providers.zhipu.api_key:
+            if self.providers.zhipu.coding_plan:
+                return "https://api.z.ai/api/coding/paas/v4"
             return self.providers.zhipu.api_base
         if self.providers.vllm.api_base:
             return self.providers.vllm.api_base
