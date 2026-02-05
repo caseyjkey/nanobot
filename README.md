@@ -166,12 +166,13 @@ nanobot agent -m "Hello from my local LLM!"
 
 ## 💬 Chat Apps
 
-Talk to your nanobot through Telegram or WhatsApp — anytime, anywhere.
+Talk to your nanobot through Telegram, WhatsApp, or Signal — anytime, anywhere.
 
 | Channel | Setup |
 |---------|-------|
 | **Telegram** | Easy (just a token) |
 | **WhatsApp** | Medium (scan QR) |
+| **Signal** | Medium (Docker + link) |
 
 <details>
 <summary><b>Telegram</b> (Recommended)</summary>
@@ -242,6 +243,55 @@ nanobot gateway
 
 </details>
 
+<details>
+<summary><b>Signal</b></summary>
+
+Requires **Docker** (for signal-cli-rest-api).
+
+**1. Start signal-cli-rest-api**
+
+```bash
+docker run -d -p 8080:8080 \
+  -v signal-data:/home/.local/share/signal-cli \
+  --name signal-rest-api \
+  bbernhard/signal-cli-rest-api
+```
+
+**2. Link device**
+
+```bash
+# Get QR code
+curl -X POST http://localhost:8080/v1/qrcodelink?device_name=nanobot
+```
+
+Scan with Signal → Settings → Linked Devices.
+
+**3. Configure**
+
+```json
+{
+  "channels": {
+    "signal": {
+      "enabled": true,
+      "phoneNumber": "+1234567890",
+      "signalService": "127.0.0.1:8080",
+      "allowFrom": ["+19876543210"]
+    }
+  }
+}
+```
+
+> Your phone number (with country code) is the bot's number.
+
+**4. Run**
+
+```bash
+# Start nanobot
+nanobot gateway
+```
+
+</details>
+
 ## ⚙️ Configuration
 
 Config file: `~/.nanobot/config.json`
@@ -286,6 +336,12 @@ Config file: `~/.nanobot/config.json`
     },
     "whatsapp": {
       "enabled": false
+    },
+    "signal": {
+      "enabled": false,
+      "phoneNumber": "+1234567890",
+      "signalService": "127.0.0.1:8080",
+      "allowFrom": ["+19876543210"]
     }
   },
   "tools": {

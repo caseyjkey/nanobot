@@ -19,10 +19,20 @@ class TelegramConfig(BaseModel):
     allow_from: list[str] = Field(default_factory=list)  # Allowed user IDs or usernames
 
 
+class SignalConfig(BaseModel):
+    """Signal channel configuration."""
+    enabled: bool = False
+    phone_number: str = ""  # Bot phone number (e.g., +1234567890)
+    signal_service: str = ""  # signal-cli-rest-api address (e.g., 127.0.0.1:8080)
+    allow_from: list[str] = Field(default_factory=list)  # Allowed phone numbers
+
+
+
 class ChannelsConfig(BaseModel):
     """Configuration for chat channels."""
     whatsapp: WhatsAppConfig = Field(default_factory=WhatsAppConfig)
     telegram: TelegramConfig = Field(default_factory=TelegramConfig)
+    signal: SignalConfig = Field(default_factory=SignalConfig)
 
 
 class AgentDefaults(BaseModel):
