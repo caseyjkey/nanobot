@@ -142,7 +142,6 @@ class SignalChannel(BaseChannel):
         }
 
         # Subscribe to outbound messages
-        self.bus.subscribe_outbound(self.name, self._on_outbound)
 
         # Start bot in separate thread - bot will be created IN the thread
         self._bot_thread = threading.Thread(
