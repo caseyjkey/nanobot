@@ -1,5 +1,8 @@
 """Test session management with cache-friendly message handling."""
 
+import asyncio
+from unittest.mock import AsyncMock, MagicMock
+
 import pytest
 from pathlib import Path
 from nanobot.session.manager import Session, SessionManager
@@ -475,3 +478,103 @@ class TestEmptyAndBoundarySessions:
         expected_count = 60 - KEEP_COUNT - 10
         assert len(old_messages) == expected_count
         assert_messages_content(old_messages, 10, 34)
+
+
+class TestNewCommandArchival:
+    """Test /new archival behavior with the simplified consolidation flow."""
+
+    @staticmethod
+    def _make_loop(tmp_path: Path):
+        from nanobot.agent.loop import AgentLoop
+        from nanobot.bus.queue import MessageBus
+        from nanobot.providers.base import LLMResponse
+
+        bus = MessageBus()
+        provider = MagicMock()
+        provider.get_default_model.return_value = "test-model"
+        provider.estimate_prompt_tokens.return_value = (10_000, "test")
+        loop = AgentLoop(
+            bus=bus,
+            provider=provider,
+            workspace=tmp_path,
+            model="test-model",
+            context_window_tokens=1,
+        )
+        loop.provider.chat_with_retry = AsyncMock(return_value=LLMResponse(content="ok", tool_calls=[]))
+        loop.tools.get_definitions = MagicMock(return_value=[])
+        return loop
+
+    @pytest.mark.asyncio
+    async def test_new_does_not_clear_session_when_archive_fails(self, tmp_path: Path) -> None:
+        from nanobot.bus.events import InboundMessage
+
+        loop = self._make_loop(tmp_path)
+        session = loop.sessions.get_or_create("cli:test")
+        for i in range(5):
+            session.add_message("user", f"msg{i}")
+            session.add_message("assistant", f"resp{i}")
+        loop.sessions.save(session)
+        before_count = len(session.messages)
+
+        async def _failing_consolidate(_messages) -> bool:
+            return False
+
+        loop.memory_consolidator.consolidate_messages = _failing_consolidate  # type: ignore[method-assign]
+
+        new_msg = InboundMessage(channel="cli", sender_id="user", chat_id="test", content="/new")
+        response = await loop._process_message(new_msg)
+
+        assert response is not None
+        assert "failed" in response.content.lower()
+        assert len(loop.sessions.get_or_create("cli:test").messages) == before_count
+
+    @pytest.mark.asyncio
+    async def test_new_archives_only_unconsolidated_messages(self, tmp_path: Path) -> None:
+        from nanobot.bus.events import InboundMessage
+
+        loop = self._make_loop(tmp_path)
+        session = loop.sessions.get_or_create("cli:test")
+        for i in range(15):
+            session.add_message("user", f"msg{i}")
+            session.add_message("assistant", f"resp{i}")
+        session.last_consolidated = len(session.messages) - 3
+        loop.sessions.save(session)
+
+        archived_count = -1
+
+        async def _fake_consolidate(messages) -> bool:
+            nonlocal archived_count
+            archived_count = len(messages)
+            return True
+
+        loop.memory_consolidator.consolidate_messages = _fake_consolidate  # type: ignore[method-assign]
+
+        new_msg = InboundMessage(channel="cli", sender_id="user", chat_id="test", content="/new")
+        response = await loop._process_message(new_msg)
+
+        assert response is not None
+        assert "new session started" in response.content.lower()
+        assert archived_count == 3
+
+    @pytest.mark.asyncio
+    async def test_new_clears_session_and_responds(self, tmp_path: Path) -> None:
+        from nanobot.bus.events import InboundMessage
+
+        loop = self._make_loop(tmp_path)
+        session = loop.sessions.get_or_create("cli:test")
+        for i in range(3):
+            session.add_message("user", f"msg{i}")
+            session.add_message("assistant", f"resp{i}")
+        loop.sessions.save(session)
+
+        async def _ok_consolidate(_messages) -> bool:
+            return True
+
+        loop.memory_consolidator.consolidate_messages = _ok_consolidate  # type: ignore[method-assign]
+
+        new_msg = InboundMessage(channel="cli", sender_id="user", chat_id="test", content="/new")
+        response = await loop._process_message(new_msg)
+
+        assert response is not None
+        assert "new session started" in response.content.lower()
+        assert loop.sessions.get_or_create("cli:test").messages == []
