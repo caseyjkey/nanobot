@@ -267,11 +267,6 @@ class LLMProvider(ABC):
                 return response
 
             if not self._is_transient_error(response.content):
-                if self._is_image_unsupported_error(response.content):
-                    stripped = self._strip_image_content(messages)
-                    if stripped is not None:
-                        logger.warning("Model does not support image input, retrying without images")
-                        return await self._safe_chat(**{**kw, "messages": stripped})
                 return response
 
             logger.warning(

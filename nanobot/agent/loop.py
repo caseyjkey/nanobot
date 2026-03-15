@@ -179,6 +179,26 @@ class AgentLoop:
             return f'{tc.name}("{val[:40]}…")' if len(val) > 40 else f'{tc.name}("{val}")'
         return ", ".join(_fmt(tc) for tc in tool_calls)
 
+    @staticmethod
+    def _inject_image_retry_hint(messages: list[dict]) -> list[dict]:
+        """Add a retry-only hint when the active model cannot inspect images directly."""
+        if not messages:
+            return messages
+        hint = (
+            "\n\n[Runtime recovery hint] The active model could not inspect the attached image directly. "
+            "If image-analysis tools are available, use them before answering."
+        )
+        updated = [dict(msg) for msg in messages]
+        first = dict(updated[0])
+        content = first.get("content")
+        if isinstance(content, str):
+            if hint.strip() not in content:
+                first["content"] = content + hint
+            updated[0] = first
+            return updated
+        updated.insert(0, {"role": "system", "content": hint.strip()})
+        return updated
+
     async def _run_agent_loop(
         self,
         initial_messages: list[dict],
@@ -189,6 +209,7 @@ class AgentLoop:
         iteration = 0
         final_content = None
         tools_used: list[str] = []
+        image_retry_attempted = False
 
         while iteration < self.max_iterations:
             iteration += 1
@@ -233,6 +254,16 @@ class AgentLoop:
                 # Don't persist error responses to session history — they can
                 # poison the context and cause permanent 400 loops (#1303).
                 if response.finish_reason == "error":
+                    stripped = LLMProvider._strip_image_content(messages)
+                    if (
+                        not image_retry_attempted
+                        and stripped is not None
+                        and LLMProvider._is_image_unsupported_error(clean)
+                    ):
+                        image_retry_attempted = True
+                        logger.warning("LLM does not support image input, retrying turn with tool-use hint")
+                        messages = self._inject_image_retry_hint(stripped)
+                        continue
                     logger.error("LLM returned error: {}", (clean or "")[:200])
                     final_content = clean or "Sorry, I encountered an error calling the AI model."
                     break

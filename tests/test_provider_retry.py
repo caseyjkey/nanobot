@@ -126,7 +126,7 @@ async def test_chat_with_retry_explicit_override_beats_defaults() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Image-unsupported fallback tests
+# Image-unsupported detection helpers
 # ---------------------------------------------------------------------------
 
 _IMAGE_MSG = [
@@ -137,23 +137,13 @@ _IMAGE_MSG = [
 ]
 
 
-@pytest.mark.asyncio
-async def test_image_unsupported_error_retries_without_images() -> None:
-    """If the model rejects image_url, retry once with images stripped."""
-    provider = ScriptedProvider([
-        LLMResponse(
-            content="Invalid content type. image_url is only supported by certain models",
-            finish_reason="error",
-        ),
-        LLMResponse(content="ok, no image"),
-    ])
+def test_strip_image_content_replaces_images_with_placeholder() -> None:
+    provider = ScriptedProvider([])
 
-    response = await provider.chat_with_retry(messages=_IMAGE_MSG)
+    stripped = provider._strip_image_content(_IMAGE_MSG)
 
-    assert response.content == "ok, no image"
-    assert provider.calls == 2
-    msgs_on_retry = provider.last_kwargs["messages"]
-    for msg in msgs_on_retry:
+    assert stripped is not None
+    for msg in stripped:
         content = msg.get("content")
         if isinstance(content, list):
             assert all(b.get("type") != "image_url" for b in content)
@@ -162,7 +152,7 @@ async def test_image_unsupported_error_retries_without_images() -> None:
 
 @pytest.mark.asyncio
 async def test_image_unsupported_error_no_retry_without_image_content() -> None:
-    """If messages don't contain image_url blocks, don't retry on image error."""
+    """Provider layer should return image errors unchanged when no image payload exists."""
     provider = ScriptedProvider([
         LLMResponse(
             content="image_url is only supported by certain models",
@@ -179,20 +169,19 @@ async def test_image_unsupported_error_no_retry_without_image_content() -> None:
 
 
 @pytest.mark.asyncio
-async def test_image_unsupported_fallback_returns_error_on_second_failure() -> None:
-    """If the image-stripped retry also fails, return that error."""
+async def test_image_unsupported_error_is_returned_without_provider_retry() -> None:
+    """Image fallback is handled by the agent loop, not directly in the provider."""
     provider = ScriptedProvider([
         LLMResponse(
             content="does not support image input",
             finish_reason="error",
         ),
-        LLMResponse(content="some other error", finish_reason="error"),
     ])
 
     response = await provider.chat_with_retry(messages=_IMAGE_MSG)
 
-    assert provider.calls == 2
-    assert response.content == "some other error"
+    assert provider.calls == 1
+    assert response.content == "does not support image input"
     assert response.finish_reason == "error"
 
 
