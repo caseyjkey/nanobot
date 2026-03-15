@@ -375,6 +375,80 @@ nanobot gateway
 </details>
 
 <details>
+<summary><b>Signal</b></summary>
+
+Requires an HTTP Signal bridge that exposes `/api/v1/check`, `/api/v1/events`, and `/api/v1/rpc`.
+The tested path is [`signal-cli-rest-api`](https://github.com/bbernhard/signal-cli-rest-api) running in `json-rpc` mode.
+
+**1. Start the Signal bridge**
+
+Example with `signal-cli-rest-api`:
+
+```bash
+docker run --rm -p 8080:8080 \
+  -e MODE=json-rpc \
+  -v ~/.local/share/signal-cli:/home/.local/share/signal-cli \
+  bbernhard/signal-cli-rest-api
+```
+
+Your registered Signal account data must be available to the bridge.
+
+**2. Configure nanobot**
+
+```json
+{
+  "channels": {
+    "signal": {
+      "enabled": true,
+      "account": "+1234567890",
+      "mentionAliases": ["nanobot"],
+      "daemonHost": "localhost",
+      "daemonPort": 8080,
+      "allowFrom": ["+15551234567"],
+      "groupMessageBufferSize": 20,
+      "dm": {
+        "enabled": true,
+        "policy": "allowlist"
+      },
+      "group": {
+        "enabled": true,
+        "policy": "allowlist",
+        "allowFrom": ["base64-or-group-id"],
+        "requireMention": true
+      }
+    }
+  }
+}
+```
+
+Legacy configs using `phoneNumber` and `signalService` are still accepted.
+
+**Configuration notes:**
+- `account`: Signal account identifier used by the bridge.
+- `mentionAliases`: Optional visible labels to treat as bot mentions when Signal omits structured mention metadata.
+- `daemonHost` / `daemonPort`: Host and port for the Signal HTTP bridge.
+- `allowFrom`: DM allowlist used when `dm.policy` is `allowlist`.
+- `groupMessageBufferSize`: Number of recent group messages to include as context when replying in groups.
+- `dm.enabled`: Enable direct-message replies.
+- `dm.policy`: `allowlist` or `open`.
+- `group.enabled`: Enable group replies.
+- `group.policy`: `allowlist` or `open`.
+- `group.allowFrom`: Allowed group IDs when `group.policy` is `allowlist`.
+- `group.requireMention`: Require a bot mention before replying in groups.
+
+**Available commands:**
+- `/reset` clears the conversation history for the current chat.
+- `/help` shows Signal channel help.
+
+**3. Run nanobot**
+
+```bash
+nanobot gateway
+```
+
+</details>
+
+<details>
 <summary><b>Matrix (Element)</b></summary>
 
 Install Matrix dependencies first:

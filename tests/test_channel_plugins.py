@@ -226,3 +226,47 @@ def test_builtin_channel_init_from_dict():
     ch = TelegramChannel({"enabled": False, "token": "test-tok", "allowFrom": ["*"]}, bus)
     assert ch.config.token == "test-tok"
     assert ch.config.allow_from == ["*"]
+
+
+class _FakePluginWithSession(BaseChannel):
+    name = "sessionplugin"
+    display_name = "Session Plugin"
+
+    def __init__(self, config, bus, session_manager=None):
+        super().__init__(config, bus)
+        self.session_manager = session_manager
+
+    async def start(self) -> None:
+        pass
+
+    async def stop(self) -> None:
+        pass
+
+    async def send(self, msg: OutboundMessage) -> None:
+        pass
+
+
+@pytest.mark.asyncio
+async def test_manager_passes_session_manager_when_channel_accepts_it():
+    fake_session_manager = object()
+    fake_config = SimpleNamespace(
+        channels=ChannelsConfig.model_validate({
+            "sessionplugin": {"enabled": True, "allowFrom": ["*"]},
+        }),
+        providers=SimpleNamespace(groq=SimpleNamespace(api_key="")),
+    )
+
+    with patch(
+        "nanobot.channels.registry.discover_all",
+        return_value={"sessionplugin": _FakePluginWithSession},
+    ):
+        mgr = ChannelManager.__new__(ChannelManager)
+        mgr.config = fake_config
+        mgr.bus = MessageBus()
+        mgr.session_manager = fake_session_manager
+        mgr.channels = {}
+        mgr._dispatch_task = None
+        mgr._init_channels()
+
+    assert "sessionplugin" in mgr.channels
+    assert mgr.channels["sessionplugin"].session_manager is fake_session_manager
