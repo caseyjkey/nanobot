@@ -1,13 +1,16 @@
 """Signal channel implementation using an HTTP JSON-RPC Signal bridge."""
 
 import asyncio
+import base64
 import json
+import mimetypes
 import re
 from collections import deque
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
 import httpx
+import websockets
 from loguru import logger
 from pydantic import Field, model_validator
 
@@ -91,6 +94,8 @@ class SignalConfig(Base):
 
         legacy_shape = legacy_account or legacy_service
         if legacy_shape:
+            if not raw.get("allow_from") and not raw.get("allowFrom"):
+                raw["allow_from"] = ["*"]
             if raw.get("dm") is None:
                 dm_policy = "allowlist" if legacy_allow_from else "open"
                 raw["dm"] = {"enabled": True, "policy": dm_policy}
@@ -108,8 +113,8 @@ class SignalConfig(Base):
 class SignalChannel(BaseChannel):
     """Signal channel using an HTTP JSON-RPC Signal bridge.
 
-    Expects endpoints compatible with `/api/v1/check`, `/api/v1/events`, and
-    `/api/v1/rpc`, such as `signal-cli-rest-api` running in `json-rpc` mode.
+    Expects `signal-cli-rest-api` style endpoints such as `/v1/about`, websocket
+    `/v1/receive/{number}`, and `POST /v2/send`.
     """
 
     name = "signal"
@@ -224,49 +229,34 @@ class SignalChannel(BaseChannel):
         await self._start_http_mode()
 
     async def _start_http_mode(self) -> None:
-        """Start Signal channel using Server-Sent Events for receiving messages."""
-        base_url = f"http://{self.config.daemon_host}:{self.config.daemon_port}"
+        """Start Signal channel using the signal-cli-rest-api transport."""
+        base_url = self._http_base_url()
         reconnect_delay_s = 1.0
         max_reconnect_delay_s = 30.0
 
         while self._running:
             try:
                 logger.info(f"Connecting to signal-cli daemon at {base_url}...")
-
-                # Create HTTP client
                 self._http = httpx.AsyncClient(timeout=60.0, base_url=base_url)
 
-                # Test connection
                 try:
-                    response = await self._http.get("/api/v1/check")
-                    if response.status_code == 200:
-                        logger.info("Connected to signal-cli daemon")
-                    else:
-                        raise ConnectionRefusedError(
-                            f"signal-cli daemon check returned status {response.status_code}"
-                        )
+                    response = await self._http.get("/v1/about")
+                    response.raise_for_status()
+                    logger.info("Connected to signal-cli-rest-api")
                 except Exception as e:
-                    raise ConnectionRefusedError(f"signal-cli daemon not responding: {e}")
+                    raise ConnectionRefusedError(f"signal-cli-rest-api not responding: {e}")
 
-                # Reset reconnect delay after successful connection check.
                 reconnect_delay_s = 1.0
-
-                # Ensure account-level typing indicators are enabled.
-                await self._ensure_typing_indicators_enabled()
-
-                # Start SSE receiver and supervise it. If it exits while we're still
-                # running, treat it as a disconnect and reconnect.
                 self._sse_task = asyncio.create_task(self._sse_receive_loop())
                 await self._sse_task
                 if self._running:
-                    raise ConnectionError("Signal SSE stream ended unexpectedly")
+                    raise ConnectionError("Signal websocket stream ended unexpectedly")
 
             except asyncio.CancelledError:
                 break
             except ConnectionRefusedError as e:
                 logger.error(
-                    f"{e}. Make sure signal-cli daemon is running: "
-                    f"signal-cli -a {self.config.account} daemon --http {self.config.daemon_host}:{self.config.daemon_port}"
+                    f"{e}. Make sure signal-cli-rest-api is running at {base_url}"
                 )
             except Exception as e:
                 logger.error(f"Signal channel error: {e}")
@@ -317,95 +307,37 @@ class SignalChannel(BaseChannel):
         """Send a message through Signal."""
         is_progress_message = bool(msg.metadata.get("_nanobot_progress"))
         try:
-            # Prepare send request
-            params: dict[str, Any] = {"message": msg.content}
-            params.update(self._recipient_params(msg.chat_id))
-
-            # Add attachments if present
-            if msg.media:
-                params["attachments"] = msg.media
-
-            # Send the message
-            response = await self._send_request("send", params)
-
-            if "error" in response:
-                logger.error(f"Error sending Signal message: {response['error']}")
-            elif "result" in response:
-                logger.debug(
-                    f"Signal message sent successfully, timestamp: {response['result'].get('timestamp')}"
-                )
-
+            payload = self._build_send_payload(msg.chat_id, msg.content, msg.media)
+            response = await self._send_v2_message(payload)
+            timestamp = response.get("timestamp")
+            if timestamp is not None:
+                logger.debug(f"Signal message sent successfully, timestamp: {timestamp}")
         except Exception as e:
             logger.error(f"Error sending Signal message: {e}")
         finally:
-            # Keep typing active across progress updates; stop on the final reply.
             if not is_progress_message:
-                # Avoid immediate START->STOP for fast responses, which can be invisible
-                # in some Signal clients. Let indicator expire naturally (~15s).
                 await self._stop_typing(msg.chat_id, send_stop=False)
 
     async def _sse_receive_loop(self) -> None:
-        """Receive messages via Server-Sent Events (HTTP mode)."""
-        if not self._http:
-            raise RuntimeError("HTTP client not initialized for Signal SSE stream")
-
-        logger.info("Started Signal message receive loop (SSE)")
-
+        """Receive messages via the signal-cli-rest-api websocket endpoint."""
+        logger.info("Started Signal message receive loop (websocket)")
         try:
-            async with self._http.stream("GET", "/api/v1/events") as response:
-                if response.status_code != 200:
-                    raise ConnectionError(
-                        f"SSE connection failed with status {response.status_code}"
-                    )
-
-                logger.info("Subscribed to Signal messages via SSE")
-
-                # Buffer for accumulating SSE data across multiple lines
-                event_buffer = []
-
-                async for line in response.aiter_lines():
+            async with websockets.connect(self._receive_websocket_url()) as websocket:
+                logger.info("Subscribed to Signal messages via websocket")
+                async for raw_message in websocket:
                     if not self._running:
                         break
-
-                    # Debug: log raw SSE lines (except keepalive pings)
-                    if line and line != ":":
-                        logger.debug(f"SSE line received: {line[:200]}")
-
-                    # SSE format handling
-                    if isinstance(line, str):
-                        # Empty line signals end of event
-                        if not line or line == ":":
-                            if event_buffer:
-                                # Try to parse the accumulated data
-                                data_str = ""
-                                try:
-                                    data_str = "".join(event_buffer)
-                                    data = json.loads(data_str)
-                                    logger.debug(f"SSE event parsed: {data}")
-                                    await self._handle_receive_notification(data)
-                                except json.JSONDecodeError as e:
-                                    logger.warning(
-                                        f"Invalid JSON in SSE buffer: {e}, data: {data_str[:200]}"
-                                    )
-                                finally:
-                                    event_buffer = []
-
-                        # "data:" line - accumulate it
-                        elif line.startswith("data:"):
-                            event_buffer.append(line[5:])  # Skip "data:" prefix
-
-                        # "event:" line - just log it (we only care about data)
-                        elif line.startswith("event:"):
-                            pass  # Ignore event type for now
+                    for item in self._decode_receive_payload(raw_message):
+                        await self._handle_receive_notification(item)
 
                 if self._running:
-                    raise ConnectionError("Signal SSE stream closed by remote endpoint")
+                    raise ConnectionError("Signal websocket stream closed by remote endpoint")
 
         except asyncio.CancelledError:
-            logger.info("SSE receive loop cancelled")
+            logger.info("Signal websocket receive loop cancelled")
             raise
         except Exception as e:
-            logger.error(f"Error in SSE receive loop: {e}")
+            logger.error(f"Error in Signal websocket receive loop: {e}")
             raise
 
     async def _handle_receive_notification(self, params: dict[str, Any]) -> None:
@@ -1117,78 +1049,84 @@ class SignalChannel(BaseChannel):
     async def _send_typing(
         self, chat_id: str, stop: bool = False, quiet_success: bool = False
     ) -> None:
-        """Send a typing START/STOP message via signal-cli."""
+        """Send a typing START/STOP message via signal-cli-rest-api."""
+        if not self._http:
+            return
         action = "stop" if stop else "start"
-        if (
-            not self._is_group_chat_id(chat_id)
-            and chat_id.startswith("+") is False
-            and chat_id not in self._typing_uuid_warnings
-        ):
-            self._typing_uuid_warnings.add(chat_id)
-            logger.warning(
-                "Signal DM recipient is UUID-only (no phone number in envelope). "
-                "Some Signal clients may not render typing indicators for this recipient form."
+        method = self._http.delete if stop else self._http.put
+        try:
+            response = await method(
+                f"/v1/typing-indicator/{self.config.account}",
+                json={"recipient": chat_id},
             )
-        candidate_params: list[dict[str, Any]]
-        if self._is_group_chat_id(chat_id):
-            candidate_params = [{"groupId": chat_id}, {"groupId": [chat_id]}]
-        else:
-            candidate_params = [{"recipient": chat_id}, {"recipient": [chat_id]}]
-
-        last_error: Any | None = None
-        for params in candidate_params:
-            if stop:
-                params["stop"] = True
-            try:
-                response = await self._send_request("sendTyping", params)
-            except Exception as e:
-                last_error = str(e)
-                continue
-
-            if "error" not in response:
-                if not quiet_success:
-                    logger.info(f"Signal typing {action} sent for {chat_id}")
-                return
-
-            last_error = response["error"]
-
-        logger.warning(f"Failed to send Signal typing {action} for {chat_id}: {last_error}")
+            response.raise_for_status()
+            if not quiet_success:
+                logger.info(f"Signal typing {action} sent for {chat_id}")
+        except Exception as e:
+            logger.warning(f"Failed to send Signal typing {action} for {chat_id}: {e}")
 
     async def _ensure_typing_indicators_enabled(self) -> None:
-        """Enable typing indicators on the bot account."""
-        response = await self._send_request(
-            "updateConfiguration", {"typingIndicators": True}
-        )
-        if "error" in response:
-            logger.warning(f"Failed to enable Signal typing indicators: {response['error']}")
-        else:
-            logger.info("Signal typing indicators enabled on account configuration")
+        """Compatibility no-op for bridges that do not expose account typing settings."""
+        return None
 
-    async def _send_request(
-        self, method: str, params: dict[str, Any] | None = None
-    ) -> dict[str, Any]:
-        """Send a JSON-RPC request via HTTP and wait for response."""
-        # Generate request ID
-        self._request_id += 1
-        request_id = self._request_id
+    def _http_base_url(self) -> str:
+        return f"http://{self.config.daemon_host}:{self.config.daemon_port}"
 
-        # Build JSON-RPC request
-        request = {"jsonrpc": "2.0", "method": method, "id": request_id}
+    def _receive_websocket_url(self) -> str:
+        scheme = "wss" if str(self.config.daemon_host).startswith("https") else "ws"
+        return f"{scheme}://{self.config.daemon_host}:{self.config.daemon_port}/v1/receive/{self.config.account}"
 
-        if params:
-            request["params"] = params
-
-        return await self._send_http_request(request)
-
-    async def _send_http_request(self, request: dict[str, Any]) -> dict[str, Any]:
-        """Send JSON-RPC request via HTTP."""
-        if not self._http:
-            raise RuntimeError("Not connected to signal-cli daemon")
-
+    def _decode_receive_payload(self, raw_message: str) -> list[dict[str, Any]]:
         try:
-            response = await self._http.post("/api/v1/rpc", json=request)
-            response.raise_for_status()
+            payload = json.loads(raw_message)
+        except json.JSONDecodeError:
+            logger.warning(f"Invalid JSON from Signal websocket: {raw_message[:200]}")
+            return []
+
+        items = payload if isinstance(payload, list) else [payload]
+        decoded: list[dict[str, Any]] = []
+        for item in items:
+            if isinstance(item, str):
+                try:
+                    item = json.loads(item)
+                except json.JSONDecodeError:
+                    logger.warning(f"Invalid nested JSON from Signal websocket: {item[:200]}")
+                    continue
+            if isinstance(item, dict):
+                decoded.append(item)
+        return decoded
+
+    def _encode_attachments(self, media: list[str] | None) -> list[str]:
+        encoded: list[str] = []
+        for path_str in media or []:
+            path = Path(path_str)
+            if not path.exists() or not path.is_file():
+                logger.warning(f"Signal attachment path not found: {path}")
+                continue
+            mime_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+            data = base64.b64encode(path.read_bytes()).decode("ascii")
+            encoded.append(f"data:{mime_type};filename={path.name};base64,{data}")
+        return encoded
+
+    def _build_send_payload(
+        self, chat_id: str, message: str, media: list[str] | None = None
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "number": self.config.account,
+            "message": message,
+            "recipients": [chat_id],
+            "text_mode": "styled",
+        }
+        attachments = self._encode_attachments(media)
+        if attachments:
+            payload["base64_attachments"] = attachments
+        return payload
+
+    async def _send_v2_message(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if not self._http:
+            raise RuntimeError("Not connected to signal-cli-rest-api")
+        response = await self._http.post("/v2/send", json=payload)
+        response.raise_for_status()
+        if response.content:
             return response.json()
-        except Exception as e:
-            logger.error(f"HTTP request failed: {e}")
-            return {"error": {"message": str(e)}}
+        return {}
